@@ -478,9 +478,10 @@ class Renderer:
             byte_avg = (sum(byte_vals) / len(byte_vals)) if byte_vals else 0
             window_secs = len(tok_vals)  # seconds of data we have so far
 
-            # fixed-width prefixes so the left │ aligns across both rows
-            tok_prefix = f" tok/s {tok_rate:>6}  in {tin:>9}  out {tout:>9} "
-            byte_prefix = f" B/s   {fmt_bytes(byte_rate):>6}  in {fmt_bytes(bin_):>9}  out {fmt_bytes(bout):>9} "
+            # fixed-width prefixes — same labels on both rows so meaning carries:
+            # "prompt" = what went up to the server, "reply" = what came back.
+            tok_prefix = f" tok/s {tok_rate:>6}  prompt {tin:>9}   reply {tout:>9} "
+            byte_prefix = f" B/s   {fmt_bytes(byte_rate):>6}  prompt {fmt_bytes(bin_):>9}   reply {fmt_bytes(bout):>9} "
             tok_suffix = f" peak {tok_peak:>6}  avg {tok_avg:>6.1f}"
             byte_suffix = f" peak {fmt_bytes(byte_peak):>7}  avg {fmt_bytes(byte_avg):>7}"
             # equalize suffix widths so right edges align

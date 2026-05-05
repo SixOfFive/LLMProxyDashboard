@@ -90,8 +90,8 @@ tokens-per-second for responses.
 ─────────────────  → 192.168.1.10:11434   override=(none)   from=off to=on   graph=42s/300s (←5m..now→)
  req /api/chat       model=qwen2.5:14b      ctx=8192   max=512    temp=0.7
  rsp │ …reply text streaming in real time
- tok/s   42  in     1234  out      567 │▁▂▃▅▆█▇▅▃▂▁│ peak    89  avg   12.4
- B/s   1.2K  in    34.5K  out    12.3K │▁▂▃▅▆█▇▅▃▂▁│ peak  4.5K  avg  800.0
+ tok/s   42  prompt    1234   reply     567 │▁▂▃▅▆█▇▅▃▂▁│ peak    89  avg   12.4
+ B/s   1.2K  prompt   34.5K   reply   12.3K │▁▂▃▅▆█▇▅▃▂▁│ peak  4.5K  avg  800.0
 > _
 ```
 
