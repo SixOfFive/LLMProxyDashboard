@@ -254,53 +254,56 @@ class RequestInfo:
             endpoint = self.endpoint
         if not cb or not isinstance(obj, dict):
             return
-        # Build a full-text snapshot of the request, regardless of toggles, so
-        # Ctrl-E can pop it out for inspection later. Stored only in memory.
-        snapshot_lines: list[str] = []
-        bits_for_header = []
-        if endpoint:
-            bits_for_header.append(endpoint)
-        if self.model:
-            bits_for_header.append(f"model={self.model}")
-        if self.num_ctx is not None:
-            bits_for_header.append(f"ctx={self.num_ctx}")
-        if self.num_predict is not None:
-            bits_for_header.append(f"max={self.num_predict}")
-        if self.temperature is not None:
-            bits_for_header.append(f"temp={self.temperature}")
-        snapshot_lines.append("[req] " + " ".join(bits_for_header))
+        # Capture a full-text snapshot of the request for later Ctrl-E inspection,
+        # but ONLY for endpoints that carry actual prompt content. Noise calls
+        # (/api/show, /api/tags, etc.) must not overwrite the most recent chat
+        # snapshot — clients poll those constantly.
+        if endpoint not in NOISE_ENDPOINTS:
+            snapshot_lines: list[str] = []
+            bits_for_header = []
+            if endpoint:
+                bits_for_header.append(endpoint)
+            if self.model:
+                bits_for_header.append(f"model={self.model}")
+            if self.num_ctx is not None:
+                bits_for_header.append(f"ctx={self.num_ctx}")
+            if self.num_predict is not None:
+                bits_for_header.append(f"max={self.num_predict}")
+            if self.temperature is not None:
+                bits_for_header.append(f"temp={self.temperature}")
+            snapshot_lines.append("[req] " + " ".join(bits_for_header))
 
-        def _snap(role: str, text: str) -> None:
-            if not text:
-                return
-            for ln in text.splitlines() or [""]:
-                snapshot_lines.append(f"[{role}] {ln}")
+            def _snap(role: str, text: str) -> None:
+                if not text:
+                    return
+                for ln in text.splitlines() or [""]:
+                    snapshot_lines.append(f"[{role}] {ln}")
 
-        sys_field = obj.get("system")
-        if isinstance(sys_field, str):
-            _snap("system", sys_field)
-        elif isinstance(sys_field, list):
-            for blk in sys_field:
-                if isinstance(blk, dict) and isinstance(blk.get("text"), str):
-                    _snap("system", blk["text"])
-        msgs = obj.get("messages")
-        if isinstance(msgs, list):
-            for m in msgs:
-                if not isinstance(m, dict):
-                    continue
-                role = m.get("role") or "msg"
-                c = m.get("content")
-                if isinstance(c, str):
-                    _snap(role, c)
-                elif isinstance(c, list):
-                    for blk in c:
-                        if isinstance(blk, dict) and isinstance(blk.get("text"), str):
-                            _snap(role, blk["text"])
-        prompt = obj.get("prompt")
-        if isinstance(prompt, str):
-            _snap("prompt", prompt)
-        with self.lock:
-            self.last_request_text = "\n".join(snapshot_lines)
+            sys_field = obj.get("system")
+            if isinstance(sys_field, str):
+                _snap("system", sys_field)
+            elif isinstance(sys_field, list):
+                for blk in sys_field:
+                    if isinstance(blk, dict) and isinstance(blk.get("text"), str):
+                        _snap("system", blk["text"])
+            msgs = obj.get("messages")
+            if isinstance(msgs, list):
+                for m in msgs:
+                    if not isinstance(m, dict):
+                        continue
+                    role = m.get("role") or "msg"
+                    c = m.get("content")
+                    if isinstance(c, str):
+                        _snap(role, c)
+                    elif isinstance(c, list):
+                        for blk in c:
+                            if isinstance(blk, dict) and isinstance(blk.get("text"), str):
+                                _snap(role, blk["text"])
+            prompt = obj.get("prompt")
+            if isinstance(prompt, str):
+                _snap("prompt", prompt)
+            with self.lock:
+                self.last_request_text = "\n".join(snapshot_lines)
 
         if not VERBOSE and endpoint in NOISE_ENDPOINTS:
             return
