@@ -26,8 +26,20 @@ from typing import Optional
 
 IS_WIN = os.name == "nt"
 
-# Set by --verbose. When False, [conn] lines are suppressed.
+# Set by --verbose. When False, [conn] lines and noise-endpoint logging are suppressed.
 VERBOSE = False
+
+# Endpoints that clients hit constantly for housekeeping. They produce no
+# meaningful prompt/reply content, so the [req] / [req-stats] / [done] lines
+# for them are filtered out by default and only emitted under --verbose.
+NOISE_ENDPOINTS = {
+    "/api/show",
+    "/api/tags",
+    "/api/version",
+    "/api/ps",
+    "/api/embed",
+    "/api/embeddings",
+}
 
 # --------------------------------------------------------------------------- #
 # Terminal setup
@@ -168,6 +180,9 @@ class RequestInfo:
         self.log_cb = None       # set by main: callable(str) -> None
         self.req_body_bytes = 0
         self.req_start_time: Optional[float] = None
+        # Full text snapshot of the most recent request body (system + messages
+        # + prompt) — used by Ctrl-E to "expand" what was just sent.
+        self.last_request_text = ""
         # display toggles — defaults: hide outgoing prompt body, show responses
         self.show_from = False
         self.show_to = True
@@ -183,6 +198,10 @@ class RequestInfo:
     def get_toggles(self):
         with self.lock:
             return self.show_from, self.show_to
+
+    def get_last_request_text(self) -> str:
+        with self.lock:
+            return self.last_request_text
 
     def set_log(self, cb) -> None:
         with self.lock:
@@ -232,7 +251,58 @@ class RequestInfo:
         with self.lock:
             cb = self.log_cb
             show_from = self.show_from
+            endpoint = self.endpoint
         if not cb or not isinstance(obj, dict):
+            return
+        # Build a full-text snapshot of the request, regardless of toggles, so
+        # Ctrl-E can pop it out for inspection later. Stored only in memory.
+        snapshot_lines: list[str] = []
+        bits_for_header = []
+        if endpoint:
+            bits_for_header.append(endpoint)
+        if self.model:
+            bits_for_header.append(f"model={self.model}")
+        if self.num_ctx is not None:
+            bits_for_header.append(f"ctx={self.num_ctx}")
+        if self.num_predict is not None:
+            bits_for_header.append(f"max={self.num_predict}")
+        if self.temperature is not None:
+            bits_for_header.append(f"temp={self.temperature}")
+        snapshot_lines.append("[req] " + " ".join(bits_for_header))
+
+        def _snap(role: str, text: str) -> None:
+            if not text:
+                return
+            for ln in text.splitlines() or [""]:
+                snapshot_lines.append(f"[{role}] {ln}")
+
+        sys_field = obj.get("system")
+        if isinstance(sys_field, str):
+            _snap("system", sys_field)
+        elif isinstance(sys_field, list):
+            for blk in sys_field:
+                if isinstance(blk, dict) and isinstance(blk.get("text"), str):
+                    _snap("system", blk["text"])
+        msgs = obj.get("messages")
+        if isinstance(msgs, list):
+            for m in msgs:
+                if not isinstance(m, dict):
+                    continue
+                role = m.get("role") or "msg"
+                c = m.get("content")
+                if isinstance(c, str):
+                    _snap(role, c)
+                elif isinstance(c, list):
+                    for blk in c:
+                        if isinstance(blk, dict) and isinstance(blk.get("text"), str):
+                            _snap(role, blk["text"])
+        prompt = obj.get("prompt")
+        if isinstance(prompt, str):
+            _snap("prompt", prompt)
+        with self.lock:
+            self.last_request_text = "\n".join(snapshot_lines)
+
+        if not VERBOSE and endpoint in NOISE_ENDPOINTS:
             return
         # the one-line [req] header is always shown — it just marks that a request
         # happened. The prompt bodies below are gated by /showfrom.
@@ -326,9 +396,12 @@ class RequestInfo:
             full = self.partial
             show_to = self.show_to
             start = self.req_start_time
+            endpoint = self.endpoint
             self.streaming = False
             self.partial = ""
         if not cb:
+            return
+        if not VERBOSE and endpoint in NOISE_ENDPOINTS:
             return
         if full and show_to:
             # split multi-line assistant output into separate log lines
@@ -497,21 +570,35 @@ class Renderer:
 
     def _resize_input_area(self, new_input_rows: int) -> None:
         """Adjust the scroll region after the input area grows or shrinks."""
-        old_input_rows = self.input_rows
+        old_top = max(1, self.rows - self.reserved_bottom())
         self.input_rows = new_input_rows
         new_top = max(1, self.rows - self.reserved_bottom())
         sys.stdout.write(set_scroll_region(1, new_top))
-        # If input shrank, blank the rows that used to be input but now belong
-        # to the scroll region (otherwise stale glyphs sit there).
-        if new_input_rows < old_input_rows:
-            for r in range(new_top + 1, self.rows + 1):
+        # When the reserved area shrinks (scroll region grows back), the rows
+        # that used to be status now live inside the scroll region — clear
+        # them so the stale status text doesn't scroll up with the log.
+        if new_top > old_top:
+            for r in range(old_top + 1, new_top + 1):
                 sys.stdout.write(at(r, 1) + CLEAR_LINE)
+        # Always blank the new reserved area so a fresh draw_status call has
+        # a clean slate.
+        for r in range(new_top + 1, self.rows + 1):
+            sys.stdout.write(at(r, 1) + CLEAR_LINE)
         sys.stdout.flush()
 
     def toggle_multi_line(self) -> None:
         with self.lock:
-            self.multi_line = not self.multi_line
-            self._resize_input_area(MULTI_INPUT_ROWS if self.multi_line else 1)
+            going_multi = not self.multi_line
+            # When expanding with an empty buffer, populate with the most recent
+            # request snapshot so the user can read what was just sent.
+            if going_multi and not self.input_buf:
+                snap = REQ_INFO.get_last_request_text()
+                if snap:
+                    self.input_buf = snap
+                    # reset history navigation since we just replaced the draft
+                    self.hist_idx = None
+            self.multi_line = going_multi
+            self._resize_input_area(MULTI_INPUT_ROWS if going_multi else 1)
             sys.stdout.write(SAVE)
             self._draw_input_unlocked()
             sys.stdout.write(RESTORE)
@@ -1327,7 +1414,7 @@ HELP_LINES = [
     "  /quit                    exit",
     "keys:",
     "  ↑ / ↓                    navigate command history",
-    "  Ctrl-E                   toggle single-line / multi-line input",
+    "  Ctrl-E                   toggle multi-line input; if empty, expands the most recent request",
     "  Esc                      clear the current input",
 ]
 

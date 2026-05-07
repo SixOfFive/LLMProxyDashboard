@@ -38,7 +38,7 @@ python llm_proxy.py --host <upstream> [--to <port>] [--bind <host:port>]
 | `--host`  | required           | Upstream host. Accepts `host`, `host:port`, or `[v6]:port`. |
 | `--to`    | `11434`            | Upstream port. Overrides any port given in `--host`. |
 | `--bind`  | `0.0.0.0:11434`    | Local bind. Accepts `host:port`, bare port, or just host. |
-| `--verbose`, `-v` | off          | Log `[conn]` open/close lines. Hidden by default. |
+| `--verbose`, `-v` | off          | Log `[conn]` open/close lines and noise-endpoint requests (`/api/show`, `/api/tags`, `/api/version`, `/api/ps`, `/api/embed`, `/api/embeddings`). Hidden by default since clients poll these constantly. |
 
 When `--bind` uses a wildcard host (`0.0.0.0`, `*`, or empty), the proxy listens
 on both IPv4 and IPv6 so `localhost` resolves correctly regardless of which
@@ -90,7 +90,7 @@ tokens-per-second for responses.
 | key       | effect                                                          |
 |-----------|-----------------------------------------------------------------|
 | `↑` / `↓` | Navigate command history.                                       |
-| `Ctrl-E`  | Toggle single-line ↔ multi-line input. In multi-line mode `Enter` inserts a newline; `Ctrl-E` again collapses the buffer back so `Enter` will submit it. |
+| `Ctrl-E`  | Toggle single-line ↔ multi-line input. If the input is empty when expanding, the most recent request (system / user / assistant turns) is loaded into the buffer so you can read what was just sent. In multi-line mode `Enter` inserts a newline; `Ctrl-E` again collapses the buffer back so `Enter` will submit it. |
 | `Esc`     | Clear the current input.                                        |
 | `Ctrl-C`  | Quit.                                                           |
 
