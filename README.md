@@ -20,6 +20,8 @@ long as the terminal supports ANSI escape codes.
   preview of the in-flight response.
 - Accepts slash commands at the prompt to change the upstream server, override
   the requested model, or toggle visibility of request/response bodies.
+- Captures every request body in memory so you can press `Ctrl-E` to expand
+  the most recent prompt — even when prompt content is hidden by default.
 
 ## Requirements
 
@@ -85,6 +87,46 @@ When content is hidden, the proxy logs a one-line summary instead — body size,
 estimated tokens, message count for requests; size, tokens, duration, and
 tokens-per-second for responses.
 
+## Log lines
+
+Lines that scroll above the status bar are tagged so you can grep / scan them.
+
+| tag           | color  | when                                                  |
+|---------------|--------|-------------------------------------------------------|
+| `[boot]`      | white  | Server bound and ready.                               |
+| `[conn]`      | grey   | Connection opened or closed (only with `--verbose`).  |
+| `[req]`       | white  | One-line header for each request: endpoint, model, ctx, max, temp. |
+| `[req-stats]` | green  | Hidden-mode summary of the request body (size, est. tokens, message count). |
+| `[system]` / `[user]` / `[assistant]` / `[prompt]` | white / orange / white | Prompt content lines when `/showfrom` is on. `[user]` is highlighted because it's usually the part you care about. |
+| `[asst]`      | green  | Assistant reply text on done (when `/showto` is on, the default). |
+| `[resp-stats]`| white  | Hidden-mode summary of the response (size, est. tokens, duration, tps). |
+| `[done]`      | white  | Authoritative counts from the upstream when available — `prompt_eval_count`, `eval_count` for Ollama, `tokens_predicted` for llama.cpp, `usage` for OpenAI-compat. |
+| `[cfg]`       | white  | Acknowledgement after a slash command changed something. |
+
+### Example: `/api/chat` with default toggles (`from=off to=on`)
+
+```
+[req] /api/chat model=qwen2.5:14b ctx=8192 max=512 temp=0.7
+[req-stats] body=4.2K  ~987t in  msgs=3
+[asst] Paris is the capital of France.
+[done] prompt_eval=987 eval=8
+```
+
+Same call after `/showfrom`:
+
+```
+[req] /api/chat model=qwen2.5:14b ctx=8192 max=512 temp=0.7
+[system] You are a helpful assistant.
+[user] What's the capital of France?
+[asst] Paris is the capital of France.
+[done] prompt_eval=987 eval=8
+```
+
+Housekeeping calls (`/api/show`, `/api/tags`, `/api/version`, `/api/ps`,
+`/api/embed`, `/api/embeddings`) are filtered out of the log entirely unless
+you pass `--verbose`. They produce no useful prompt content and clients hit
+them on every render.
+
 ## Keys
 
 | key       | effect                                                          |
@@ -106,30 +148,63 @@ tokens-per-second for responses.
 > _
 ```
 
-- **Footer**: upstream target, model override, toggle states, sparkline window length.
+- **Footer**: upstream target, model override, the `from`/`to` toggle states, and
+  how much of the 5-minute sparkline window has been filled (`graph=NNs/300s`).
 - **Request row**: endpoint, model, context size, max tokens, temperature for
   the most recent request. Fields not specified in the request body show as
-  `(default)` since the upstream server falls back to its own defaults.
+  `(default)` — the upstream falls back to its own defaults. Ollama clients
+  change these per call, so the row reflects whatever the most recent request
+  asked for.
 - **Response row**: live tail of the assistant's text as it streams. Newlines
   are shown as `⏎` so the row stays single-line.
 - **Token / byte rows**: current rate, totals, sparkline of the last 5 minutes,
-  peak, and average.
-- **Input row**: prompt for slash commands.
+  plus `peak` (max in window) and `avg` (window mean) so the bars are anchored
+  to a known scale instead of just being abstract bars.
+- **Input row**: prompt for slash commands and free text.
 
-The scrolling area above the status bar logs each request and response. Lines
-are color-coded: `[conn]` in grey, `[asst]` in green, `[user]` in orange.
+### Multi-line input view
+
+Pressing `Ctrl-E` expands the input to six rows — one header, five content rows.
+If the buffer is empty when expanding, the most recent request body
+(`[req]`, `[system]`, `[user]`, `[assistant]`, `[prompt]`) is loaded so you can
+read what was just sent, even with `/hidefrom` on:
+
+```
+ ┄ multi-line ┄ Enter=newline  Ctrl-E=collapse  PgUp/PgDn=scroll  Esc=clear  [1-5/12]
+↑ [req] /api/chat model=qwen2.5:14b ctx=8192 max=512 temp=0.7
+  [system] You are a helpful assistant.
+  [user] What's the capital of France?
+  [user] And what's its population?
+↓ [user] One more thing — anything notable about it?
+> _
+```
+
+`[1-5/12]` shows which lines are visible out of the total. The `↑` / `↓`
+markers on the edge rows indicate that more content sits above or below.
+`PgUp` / `PgDn` scroll one page at a time. Editing or `Esc` snaps back to the
+bottom. Press `Ctrl-E` again to collapse — newlines become `⏎` in the
+single-line buffer; `Enter` then submits the whole thing.
 
 ## How token counts are computed
 
-- **Input tokens**: estimated by walking the request body's `messages` /
-  `system` / `prompt` fields and dividing total characters by 4.
-- **Output tokens**: estimated per-chunk from the streamed text. When the
-  upstream emits authoritative counts (`prompt_eval_count` / `eval_count` for
-  Ollama, `tokens_predicted` for llama.cpp, `usage` for the OpenAI-compatible
-  endpoints), they are logged on the `[done]` line for cross-reference.
+There are two numbers floating around: a **live estimate** (what drives the
+`tok/s` rate and sparkline) and the **authoritative count** the upstream
+reports at the end of a request.
 
-The estimate exists because clients want a live `tok/s` number that updates
-continuously, not just a final total. Treat it as approximate.
+- **Live estimate** — characters divided by 4. Computed per request body
+  (input) and per streamed chunk (output) so the dashboard updates every
+  second instead of only on completion. Treat it as approximate; the divisor
+  is a reasonable default for English text and many models.
+- **Authoritative count** — pulled from the final response chunk and emitted
+  on the `[done]` line for cross-reference:
+  - Ollama: `prompt_eval_count`, `eval_count`
+  - llama.cpp `/completion`: `tokens_evaluated`, `tokens_predicted`
+  - OpenAI-compat: `usage.prompt_tokens`, `usage.completion_tokens`
+
+The estimate is not corrected to the authoritative count — that would cause
+the running totals and sparklines to jump backwards on each completion. If
+you need exact numbers, read the `[done]` line; if you want a live feel for
+throughput, watch the `tok/s` row.
 
 ## Caveats
 
