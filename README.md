@@ -91,6 +91,7 @@ tokens-per-second for responses.
 |-----------|-----------------------------------------------------------------|
 | `↑` / `↓` | Navigate command history.                                       |
 | `Ctrl-E`  | Toggle single-line ↔ multi-line input. If the input is empty when expanding, the most recent request (system / user / assistant turns) is loaded into the buffer so you can read what was just sent. In multi-line mode `Enter` inserts a newline; `Ctrl-E` again collapses the buffer back so `Enter` will submit it. |
+| `PgUp` / `PgDn` | Scroll the multi-line input view by a page when the buffer is larger than the visible area. The header shows the visible line range, e.g. `[1-5/12]`. Editing or pressing Esc snaps back to the bottom. |
 | `Esc`     | Clear the current input.                                        |
 | `Ctrl-C`  | Quit.                                                           |
 

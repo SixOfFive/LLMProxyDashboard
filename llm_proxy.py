@@ -493,6 +493,7 @@ class Renderer:
         # input area state
         self.multi_line = False
         self.input_rows = 1
+        self.input_scroll = 0   # multi-line: lines offset from bottom (0 = tail)
         # history
         self.history: list[str] = []
         self.hist_idx: Optional[int] = None  # None = editing draft
@@ -548,16 +549,36 @@ class Renderer:
             return
         # multi-line: header + content rows, last input_rows rows of terminal
         first_row = rows - self.input_rows + 1
-        header = " ┄ multi-line ┄ Enter=newline  Ctrl-E=collapse&submit-ready  Esc=clear"[:cols]
-        sys.stdout.write(at(first_row, 1) + CLEAR_LINE + header)
-        # content area: split buffer by \n, fit into (input_rows - 1) rows
+        content_rows = self.input_rows - 1
         lines = self.input_buf.split("\n")
-        # show the LAST (input_rows - 1) lines so user always sees the cursor end
-        visible = lines[-(self.input_rows - 1):]
-        for i in range(self.input_rows - 1):
+        total = len(lines)
+        # clamp scroll to valid range
+        max_scroll = max(0, total - content_rows)
+        if self.input_scroll > max_scroll:
+            self.input_scroll = max_scroll
+        end = total - self.input_scroll
+        start = max(0, end - content_rows)
+        visible = lines[start:end]
+        # header with scroll indicator
+        if total > content_rows:
+            pos = f" [{start + 1}-{end}/{total}]"
+        else:
+            pos = ""
+        header = (
+            " ┄ multi-line ┄ Enter=newline  Ctrl-E=collapse  PgUp/PgDn=scroll  Esc=clear"
+            + pos
+        )[:cols]
+        sys.stdout.write(at(first_row, 1) + CLEAR_LINE + header)
+        # row markers: ↑ if more above, ↓ if more below
+        for i in range(content_rows):
             row = first_row + 1 + i
             txt = visible[i] if i < len(visible) else ""
-            mark = "┃ " if i == 0 and len(lines) > self.input_rows - 1 else "  "
+            if i == 0 and start > 0:
+                mark = "↑ "
+            elif i == content_rows - 1 and end < total:
+                mark = "↓ "
+            else:
+                mark = "  "
             sys.stdout.write(at(row, 1) + CLEAR_LINE + (mark + txt)[:cols])
 
     def redraw_input(self) -> None:
@@ -598,6 +619,7 @@ class Renderer:
                     # reset history navigation since we just replaced the draft
                     self.hist_idx = None
             self.multi_line = going_multi
+            self.input_scroll = 0
             self._resize_input_area(MULTI_INPUT_ROWS if going_multi else 1)
             sys.stdout.write(SAVE)
             self._draw_input_unlocked()
@@ -625,6 +647,25 @@ class Renderer:
             elif self.hist_idx > 0:
                 self.hist_idx -= 1
             self.input_buf = self.history[self.hist_idx]
+            self.input_scroll = 0
+        self.redraw_input()
+
+    def input_pgup(self) -> None:
+        if not self.multi_line:
+            return
+        with self.lock:
+            page = max(1, self.input_rows - 1)
+            total = self.input_buf.count("\n") + 1
+            max_scroll = max(0, total - page)
+            self.input_scroll = min(self.input_scroll + page, max_scroll)
+        self.redraw_input()
+
+    def input_pgdn(self) -> None:
+        if not self.multi_line:
+            return
+        with self.lock:
+            page = max(1, self.input_rows - 1)
+            self.input_scroll = max(0, self.input_scroll - page)
         self.redraw_input()
 
     def history_next(self) -> None:
@@ -638,6 +679,7 @@ class Renderer:
                 self.hist_idx = None
                 self.input_buf = self.draft
                 self.draft = ""
+            self.input_scroll = 0
         self.redraw_input()
 
     def draw_status(self, target_host: str, target_port: int, model_override: Optional[str]) -> None:
@@ -1322,6 +1364,10 @@ def input_loop(renderer: Renderer, state: ProxyState, stop_event: threading.Even
                     renderer.history_prev()
                 elif code == "P":    # down arrow
                     renderer.history_next()
+                elif code == "I":    # Page Up
+                    renderer.input_pgup()
+                elif code == "Q":    # Page Down
+                    renderer.input_pgdn()
                 # left/right/F-keys ignored
                 continue
             if ch == "\x05":  # Ctrl-E
@@ -1331,23 +1377,27 @@ def input_loop(renderer: Renderer, state: ProxyState, stop_event: threading.Even
             if ch in ("\r", "\n"):
                 if renderer.multi_line:
                     renderer.input_buf += "\n"
+                    renderer.input_scroll = 0
                     renderer.redraw_input()
                 else:
                     submit()
             elif ch == "\b":
                 if renderer.input_buf:
                     renderer.input_buf = renderer.input_buf[:-1]
+                    renderer.input_scroll = 0
                     renderer.redraw_input()
             elif ch == "\x03":  # Ctrl-C
                 stop_event.set()
                 return
             elif ch == "\x1b":  # ESC: clear pending
                 renderer.input_buf = ""
+                renderer.input_scroll = 0
                 renderer.redraw_input()
             elif ch == "\t":
                 continue
             elif ch.isprintable():
                 renderer.input_buf += ch
+                renderer.input_scroll = 0
                 renderer.redraw_input()
     else:
         import termios, tty, select
@@ -1361,33 +1411,49 @@ def input_loop(renderer: Renderer, state: ProxyState, stop_event: threading.Even
                     continue
                 ch = sys.stdin.read(1)
                 if ch == "\x1b":
-                    # could be bare ESC or arrow-key escape sequence
+                    # could be bare ESC or a CSI escape sequence
                     r2, _, _ = select.select([sys.stdin], [], [], 0.05)
-                    if r2:
-                        rest = sys.stdin.read(2)
-                        if rest == "[A":
-                            renderer.history_prev()
-                            continue
-                        if rest == "[B":
-                            renderer.history_next()
-                            continue
-                        # left/right or other CSI: ignore
+                    if not r2:
+                        renderer.input_buf = ""
+                        renderer.input_scroll = 0
+                        renderer.redraw_input()
                         continue
-                    # bare ESC: clear input
-                    renderer.input_buf = ""
-                    renderer.redraw_input()
+                    seq_start = sys.stdin.read(1)
+                    if seq_start != "[":
+                        continue  # other ESC sequence, ignore
+                    # collect the rest of the CSI: digits/semicolons, then a final
+                    csi = ""
+                    while True:
+                        r3, _, _ = select.select([sys.stdin], [], [], 0.05)
+                        if not r3:
+                            break
+                        c = sys.stdin.read(1)
+                        csi += c
+                        if c.isalpha() or c == "~":
+                            break
+                    if csi == "A":
+                        renderer.history_prev()
+                    elif csi == "B":
+                        renderer.history_next()
+                    elif csi == "5~":
+                        renderer.input_pgup()
+                    elif csi == "6~":
+                        renderer.input_pgdn()
+                    # other CSI: ignore
                 elif ch == "\x05":  # Ctrl-E
                     renderer.toggle_multi_line()
                     redraw_full()
                 elif ch in ("\r", "\n"):
                     if renderer.multi_line:
                         renderer.input_buf += "\n"
+                        renderer.input_scroll = 0
                         renderer.redraw_input()
                     else:
                         submit()
                 elif ch in ("\x7f", "\b"):
                     if renderer.input_buf:
                         renderer.input_buf = renderer.input_buf[:-1]
+                        renderer.input_scroll = 0
                         renderer.redraw_input()
                 elif ch == "\x03":
                     stop_event.set()
@@ -1396,6 +1462,7 @@ def input_loop(renderer: Renderer, state: ProxyState, stop_event: threading.Even
                     continue
                 elif ch.isprintable():
                     renderer.input_buf += ch
+                    renderer.input_scroll = 0
                     renderer.redraw_input()
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -1415,6 +1482,7 @@ HELP_LINES = [
     "keys:",
     "  ↑ / ↓                    navigate command history",
     "  Ctrl-E                   toggle multi-line input; if empty, expands the most recent request",
+    "  PgUp / PgDn              scroll the multi-line input view (when buffer is bigger than the area)",
     "  Esc                      clear the current input",
 ]
 
