@@ -183,6 +183,9 @@ class RequestInfo:
         # Full text snapshot of the most recent request body (system + messages
         # + prompt) — used by Ctrl-E to "expand" what was just sent.
         self.last_request_text = ""
+        self.last_request_endpoint = ""
+        self.last_request_model = ""
+        self.last_request_time: Optional[float] = None
         # display toggles — defaults: hide outgoing prompt body, show responses
         self.show_from = False
         self.show_to = True
@@ -202,6 +205,11 @@ class RequestInfo:
     def get_last_request_text(self) -> str:
         with self.lock:
             return self.last_request_text
+
+    def get_last_request_meta(self):
+        """Return (endpoint, model, time) of the most recent captured request."""
+        with self.lock:
+            return self.last_request_endpoint, self.last_request_model, self.last_request_time
 
     def set_log(self, cb) -> None:
         with self.lock:
@@ -304,6 +312,9 @@ class RequestInfo:
                 _snap("prompt", prompt)
             with self.lock:
                 self.last_request_text = "\n".join(snapshot_lines)
+                self.last_request_endpoint = endpoint
+                self.last_request_model = self.model
+                self.last_request_time = time.time()
 
         if not VERBOSE and endpoint in NOISE_ENDPOINTS:
             return
@@ -497,6 +508,8 @@ class Renderer:
         self.multi_line = False
         self.input_rows = 1
         self.input_scroll = 0   # multi-line: lines offset from bottom (0 = tail)
+        self.viewing_snapshot = False  # buffer was loaded by Ctrl-E from REQ_INFO
+        self.snapshot_meta = ("", "", None)  # (endpoint, model, epoch_time)
         # history
         self.history: list[str] = []
         self.hist_idx: Optional[int] = None  # None = editing draft
@@ -567,11 +580,25 @@ class Renderer:
             pos = f" [{start + 1}-{end}/{total}]"
         else:
             pos = ""
-        header = (
-            " ┄ multi-line ┄ Enter=newline  Ctrl-E=collapse  PgUp/PgDn=scroll  Esc=clear"
-            + pos
-        )[:cols]
-        sys.stdout.write(at(first_row, 1) + CLEAR_LINE + header)
+        if self.viewing_snapshot:
+            ep, mdl, t = self.snapshot_meta
+            when = ""
+            if t is not None:
+                age = max(0, int(time.time() - t))
+                when = f" ({age}s ago)"
+            label = f" ◀ viewing last request ▶ {ep or '?'}  model={mdl or '?'}{when}"
+            header_text = label + "   PgUp/PgDn=scroll  Esc=clear  Ctrl-E=close" + pos
+            # bright cyan + reverse video so the snapshot mode is unmistakable
+            color = "\x1b[1;36;7m"
+        else:
+            header_text = (
+                " ┄ multi-line ┄ Enter=newline  Ctrl-E=collapse  PgUp/PgDn=scroll  Esc=clear"
+                + pos
+            )
+            color = "\x1b[2m"  # dim
+        # pad to full width so the highlight extends across the whole row
+        header_text = header_text[:cols].ljust(cols)
+        sys.stdout.write(at(first_row, 1) + CLEAR_LINE + color + header_text + RESET)
         # row markers: ↑ if more above, ↓ if more below
         for i in range(content_rows):
             row = first_row + 1 + i
@@ -619,8 +646,12 @@ class Renderer:
                 snap = REQ_INFO.get_last_request_text()
                 if snap:
                     self.input_buf = snap
-                    # reset history navigation since we just replaced the draft
+                    self.viewing_snapshot = True
+                    self.snapshot_meta = REQ_INFO.get_last_request_meta()
                     self.hist_idx = None
+            if not going_multi:
+                # collapsing — clear snapshot mode (typing is now intentional)
+                self.viewing_snapshot = False
             self.multi_line = going_multi
             self.input_scroll = 0
             self._resize_input_area(MULTI_INPUT_ROWS if going_multi else 1)
@@ -651,6 +682,7 @@ class Renderer:
                 self.hist_idx -= 1
             self.input_buf = self.history[self.hist_idx]
             self.input_scroll = 0
+            self.viewing_snapshot = False
         self.redraw_input()
 
     def input_pgup(self) -> None:
@@ -683,6 +715,7 @@ class Renderer:
                 self.input_buf = self.draft
                 self.draft = ""
             self.input_scroll = 0
+            self.viewing_snapshot = False
         self.redraw_input()
 
     def draw_status(self, target_host: str, target_port: int, model_override: Optional[str]) -> None:
@@ -1381,6 +1414,7 @@ def input_loop(renderer: Renderer, state: ProxyState, stop_event: threading.Even
                 if renderer.multi_line:
                     renderer.input_buf += "\n"
                     renderer.input_scroll = 0
+                    renderer.viewing_snapshot = False
                     renderer.redraw_input()
                 else:
                     submit()
@@ -1388,6 +1422,7 @@ def input_loop(renderer: Renderer, state: ProxyState, stop_event: threading.Even
                 if renderer.input_buf:
                     renderer.input_buf = renderer.input_buf[:-1]
                     renderer.input_scroll = 0
+                    renderer.viewing_snapshot = False
                     renderer.redraw_input()
             elif ch == "\x03":  # Ctrl-C
                 stop_event.set()
@@ -1466,6 +1501,7 @@ def input_loop(renderer: Renderer, state: ProxyState, stop_event: threading.Even
                 elif ch.isprintable():
                     renderer.input_buf += ch
                     renderer.input_scroll = 0
+                    renderer.viewing_snapshot = False
                     renderer.redraw_input()
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
