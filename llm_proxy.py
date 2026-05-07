@@ -26,6 +26,9 @@ from typing import Optional
 
 IS_WIN = os.name == "nt"
 
+# Set by --verbose. When False, [conn] lines are suppressed.
+VERBOSE = False
+
 # --------------------------------------------------------------------------- #
 # Terminal setup
 # --------------------------------------------------------------------------- #
@@ -402,7 +405,10 @@ def sparkline(values, width: int) -> str:
 # Renderer
 # --------------------------------------------------------------------------- #
 
-RESERVED_BOTTOM = 6  # sep+footer, req-info, response-preview, tok/s, B/s, input
+# Status rows above input: sep+footer, req-info, response-preview, tok/s, B/s.
+STATUS_ROWS_ABOVE_INPUT = 5
+MULTI_INPUT_ROWS = 6   # rows reserved for the input area when expanded
+HISTORY_LIMIT = 100
 
 
 class Renderer:
@@ -411,12 +417,22 @@ class Renderer:
         self.input_buf = ""
         self.message = ""  # transient command feedback
         self.lock = threading.Lock()
+        # input area state
+        self.multi_line = False
+        self.input_rows = 1
+        # history
+        self.history: list[str] = []
+        self.hist_idx: Optional[int] = None  # None = editing draft
+        self.draft = ""
         self._setup()
+
+    def reserved_bottom(self) -> int:
+        return STATUS_ROWS_ABOVE_INPUT + self.input_rows
 
     def _setup(self) -> None:
         sys.stdout.write(HIDE_CURSOR)
         sys.stdout.write("\x1b[2J")  # clear screen
-        sys.stdout.write(set_scroll_region(1, max(1, self.rows - RESERVED_BOTTOM)))
+        sys.stdout.write(set_scroll_region(1, max(1, self.rows - self.reserved_bottom())))
         sys.stdout.write(at(1, 1))
         sys.stdout.flush()
 
@@ -431,7 +447,7 @@ class Renderer:
         cols, rows = term_size()
         if (cols, rows) != (self.cols, self.rows):
             self.cols, self.rows = cols, rows
-            sys.stdout.write(set_scroll_region(1, max(1, rows - RESERVED_BOTTOM)))
+            sys.stdout.write(set_scroll_region(1, max(1, rows - self.reserved_bottom())))
             sys.stdout.flush()
 
     def print_above(self, line: str) -> None:
@@ -440,7 +456,7 @@ class Renderer:
         with self.lock:
             sys.stdout.write(SAVE)
             # Move into scroll region last visible row, write + newline (causes scroll)
-            sys.stdout.write(at(max(1, self.rows - RESERVED_BOTTOM), 1))
+            sys.stdout.write(at(max(1, self.rows - self.reserved_bottom()), 1))
             sys.stdout.write("\n" + colored)
             sys.stdout.write(RESTORE)
             sys.stdout.flush()
@@ -448,16 +464,94 @@ class Renderer:
     def set_message(self, msg: str) -> None:
         self.message = msg
 
-    def redraw_input(self) -> None:
-        """Fast partial redraw of just the input row. Called per keystroke."""
-        with self.lock:
-            cols = self.cols
-            rows = self.rows
-            line = ("> " + self.input_buf)[:cols]
-            sys.stdout.write(SAVE)
+    def _draw_input_unlocked(self) -> None:
+        cols = self.cols
+        rows = self.rows
+        if not self.multi_line:
+            # render any embedded newlines as ⏎ so the terminal cursor stays put
+            safe = self.input_buf.replace("\r", "").replace("\n", "⏎")
+            line = ("> " + safe)[:cols]
             sys.stdout.write(at(rows, 1) + CLEAR_LINE + line)
+            return
+        # multi-line: header + content rows, last input_rows rows of terminal
+        first_row = rows - self.input_rows + 1
+        header = " ┄ multi-line ┄ Enter=newline  Ctrl-E=collapse&submit-ready  Esc=clear"[:cols]
+        sys.stdout.write(at(first_row, 1) + CLEAR_LINE + header)
+        # content area: split buffer by \n, fit into (input_rows - 1) rows
+        lines = self.input_buf.split("\n")
+        # show the LAST (input_rows - 1) lines so user always sees the cursor end
+        visible = lines[-(self.input_rows - 1):]
+        for i in range(self.input_rows - 1):
+            row = first_row + 1 + i
+            txt = visible[i] if i < len(visible) else ""
+            mark = "┃ " if i == 0 and len(lines) > self.input_rows - 1 else "  "
+            sys.stdout.write(at(row, 1) + CLEAR_LINE + (mark + txt)[:cols])
+
+    def redraw_input(self) -> None:
+        """Fast partial redraw of just the input area. Called per keystroke."""
+        with self.lock:
+            sys.stdout.write(SAVE)
+            self._draw_input_unlocked()
             sys.stdout.write(RESTORE)
             sys.stdout.flush()
+
+    def _resize_input_area(self, new_input_rows: int) -> None:
+        """Adjust the scroll region after the input area grows or shrinks."""
+        old_input_rows = self.input_rows
+        self.input_rows = new_input_rows
+        new_top = max(1, self.rows - self.reserved_bottom())
+        sys.stdout.write(set_scroll_region(1, new_top))
+        # If input shrank, blank the rows that used to be input but now belong
+        # to the scroll region (otherwise stale glyphs sit there).
+        if new_input_rows < old_input_rows:
+            for r in range(new_top + 1, self.rows + 1):
+                sys.stdout.write(at(r, 1) + CLEAR_LINE)
+        sys.stdout.flush()
+
+    def toggle_multi_line(self) -> None:
+        with self.lock:
+            self.multi_line = not self.multi_line
+            self._resize_input_area(MULTI_INPUT_ROWS if self.multi_line else 1)
+            sys.stdout.write(SAVE)
+            self._draw_input_unlocked()
+            sys.stdout.write(RESTORE)
+            sys.stdout.flush()
+
+    # ---- history ----
+    def push_history(self, line: str) -> None:
+        with self.lock:
+            line = line.strip("\n")
+            if line and (not self.history or self.history[-1] != line):
+                self.history.append(line)
+                if len(self.history) > HISTORY_LIMIT:
+                    self.history.pop(0)
+            self.hist_idx = None
+            self.draft = ""
+
+    def history_prev(self) -> None:
+        with self.lock:
+            if not self.history:
+                return
+            if self.hist_idx is None:
+                self.draft = self.input_buf
+                self.hist_idx = len(self.history) - 1
+            elif self.hist_idx > 0:
+                self.hist_idx -= 1
+            self.input_buf = self.history[self.hist_idx]
+        self.redraw_input()
+
+    def history_next(self) -> None:
+        with self.lock:
+            if self.hist_idx is None:
+                return
+            if self.hist_idx < len(self.history) - 1:
+                self.hist_idx += 1
+                self.input_buf = self.history[self.hist_idx]
+            else:
+                self.hist_idx = None
+                self.input_buf = self.draft
+                self.draft = ""
+        self.redraw_input()
 
     def draw_status(self, target_host: str, target_port: int, model_override: Optional[str]) -> None:
         with self.lock:
@@ -536,15 +630,15 @@ class Renderer:
                 preview = "…" + preview[-(avail - 1):]
             rsp_row = (prefix + preview)[:cols]
 
-            input_line = ("> " + self.input_buf)[:cols]
+            top = rows - self.reserved_bottom() + 1  # first row of status block
 
             sys.stdout.write(SAVE)
-            sys.stdout.write(at(rows - 5, 1) + CLEAR_LINE + sep_line)
-            sys.stdout.write(at(rows - 4, 1) + CLEAR_LINE + req_row)
-            sys.stdout.write(at(rows - 3, 1) + CLEAR_LINE + rsp_row)
-            sys.stdout.write(at(rows - 2, 1) + CLEAR_LINE + tok_line)
-            sys.stdout.write(at(rows - 1, 1) + CLEAR_LINE + byte_line)
-            sys.stdout.write(at(rows, 1) + CLEAR_LINE + input_line)
+            sys.stdout.write(at(top + 0, 1) + CLEAR_LINE + sep_line)
+            sys.stdout.write(at(top + 1, 1) + CLEAR_LINE + req_row)
+            sys.stdout.write(at(top + 2, 1) + CLEAR_LINE + rsp_row)
+            sys.stdout.write(at(top + 3, 1) + CLEAR_LINE + tok_line)
+            sys.stdout.write(at(top + 4, 1) + CLEAR_LINE + byte_line)
+            self._draw_input_unlocked()
             sys.stdout.write(RESTORE)
             sys.stdout.flush()
 
@@ -1048,7 +1142,8 @@ async def handle_client(reader, writer, state: ProxyState, renderer: Renderer):
         renderer.print_above(f"[conn] failed {host}:{port} from {peer}: {e}")
         writer.close()
         return
-    renderer.print_above(f"[conn] {peer} → {host}:{port}")
+    if VERBOSE:
+        renderer.print_above(f"[conn] {peer} → {host}:{port}")
 
     rewriter = RequestRewriter(state.get_model)
     sniffer = ResponseSniffer()
@@ -1101,7 +1196,8 @@ async def handle_client(reader, writer, state: ProxyState, renderer: Renderer):
                 pass
 
     await asyncio.gather(client_to_server(), server_to_client())
-    renderer.print_above(f"[conn] closed {peer}")
+    if VERBOSE:
+        renderer.print_above(f"[conn] closed {peer}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1109,27 +1205,48 @@ async def handle_client(reader, writer, state: ProxyState, renderer: Renderer):
 # --------------------------------------------------------------------------- #
 
 def input_loop(renderer: Renderer, state: ProxyState, stop_event: threading.Event):
-    """Blocking key reader. Each keystroke immediately repaints the input row."""
+    """Blocking key reader. Each keystroke immediately repaints the input area."""
+
+    def redraw_full() -> None:
+        host, port = state.get_target()
+        renderer.draw_status(host, port, state.get_model())
+
+    def submit() -> None:
+        cmd = renderer.input_buf
+        renderer.push_history(cmd)
+        renderer.input_buf = ""
+        renderer.redraw_input()
+        handle_command(cmd, renderer, state, stop_event)
+
     if IS_WIN:
         import msvcrt
         while not stop_event.is_set():
             try:
-                ch = msvcrt.getwch()  # blocking — instant response
+                ch = msvcrt.getwch()
             except (KeyboardInterrupt, OSError):
                 stop_event.set()
                 return
             if ch in ("\x00", "\xe0"):
-                # function/arrow key; consume scan code and ignore
                 try:
-                    msvcrt.getwch()
+                    code = msvcrt.getwch()
                 except Exception:
-                    pass
+                    continue
+                if code == "H":      # up arrow
+                    renderer.history_prev()
+                elif code == "P":    # down arrow
+                    renderer.history_next()
+                # left/right/F-keys ignored
+                continue
+            if ch == "\x05":  # Ctrl-E
+                renderer.toggle_multi_line()
+                redraw_full()
                 continue
             if ch in ("\r", "\n"):
-                cmd = renderer.input_buf
-                renderer.input_buf = ""
-                renderer.redraw_input()
-                handle_command(cmd, renderer, state, stop_event)
+                if renderer.multi_line:
+                    renderer.input_buf += "\n"
+                    renderer.redraw_input()
+                else:
+                    submit()
             elif ch == "\b":
                 if renderer.input_buf:
                     renderer.input_buf = renderer.input_buf[:-1]
@@ -1140,6 +1257,8 @@ def input_loop(renderer: Renderer, state: ProxyState, stop_event: threading.Even
             elif ch == "\x1b":  # ESC: clear pending
                 renderer.input_buf = ""
                 renderer.redraw_input()
+            elif ch == "\t":
+                continue
             elif ch.isprintable():
                 renderer.input_buf += ch
                 renderer.redraw_input()
@@ -1154,11 +1273,31 @@ def input_loop(renderer: Renderer, state: ProxyState, stop_event: threading.Even
                 if not r:
                     continue
                 ch = sys.stdin.read(1)
-                if ch in ("\r", "\n"):
-                    cmd = renderer.input_buf
+                if ch == "\x1b":
+                    # could be bare ESC or arrow-key escape sequence
+                    r2, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    if r2:
+                        rest = sys.stdin.read(2)
+                        if rest == "[A":
+                            renderer.history_prev()
+                            continue
+                        if rest == "[B":
+                            renderer.history_next()
+                            continue
+                        # left/right or other CSI: ignore
+                        continue
+                    # bare ESC: clear input
                     renderer.input_buf = ""
                     renderer.redraw_input()
-                    handle_command(cmd, renderer, state, stop_event)
+                elif ch == "\x05":  # Ctrl-E
+                    renderer.toggle_multi_line()
+                    redraw_full()
+                elif ch in ("\r", "\n"):
+                    if renderer.multi_line:
+                        renderer.input_buf += "\n"
+                        renderer.redraw_input()
+                    else:
+                        submit()
                 elif ch in ("\x7f", "\b"):
                     if renderer.input_buf:
                         renderer.input_buf = renderer.input_buf[:-1]
@@ -1166,9 +1305,8 @@ def input_loop(renderer: Renderer, state: ProxyState, stop_event: threading.Even
                 elif ch == "\x03":
                     stop_event.set()
                     return
-                elif ch == "\x1b":
-                    renderer.input_buf = ""
-                    renderer.redraw_input()
+                elif ch == "\t":
+                    continue
                 elif ch.isprintable():
                     renderer.input_buf += ch
                     renderer.redraw_input()
@@ -1176,10 +1314,22 @@ def input_loop(renderer: Renderer, state: ProxyState, stop_event: threading.Even
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-HELP_TEXT = (
-    "commands: /help  /model [name]  /server <host[:port]>"
-    "  /showfrom /hidefrom  /showto /hideto  /quit"
-)
+HELP_LINES = [
+    "commands:",
+    "  /help                    show this help",
+    "  /model <name>            rewrite the 'model' field in outgoing JSON requests",
+    "  /model                   clear the model override",
+    "  /server <host[:port]>    change upstream destination (new connections only)",
+    "  /showfrom                show prompts sent to the server",
+    "  /hidefrom                hide prompts (default) — show one-line stats instead",
+    "  /showto                  show the assistant's reply text (default)",
+    "  /hideto                  hide the reply — show one-line stats instead",
+    "  /quit                    exit",
+    "keys:",
+    "  ↑ / ↓                    navigate command history",
+    "  Ctrl-E                   toggle single-line / multi-line input",
+    "  Esc                      clear the current input",
+]
 
 
 def handle_command(cmd: str, renderer: Renderer, state: ProxyState, stop_event: threading.Event):
@@ -1193,7 +1343,8 @@ def handle_command(cmd: str, renderer: Renderer, state: ProxyState, stop_event: 
     op = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
     if op == "/help":
-        renderer.print_above(HELP_TEXT)
+        for ln in HELP_LINES:
+            renderer.print_above(ln)
         renderer.set_message("")
     elif op == "/quit" or op == "/exit":
         stop_event.set()
@@ -1312,7 +1463,11 @@ def main():
     ap.add_argument("--to", dest="port_to", type=int, default=None,
                     help=f"upstream port (default {DEFAULT_PORT}, or port from --host)")
     ap.add_argument("--host", required=True, help="upstream host as host or host:port")
+    ap.add_argument("--verbose", "-v", action="store_true",
+                    help="show [conn] open/close lines (hidden by default)")
     args = ap.parse_args()
+    global VERBOSE
+    VERBOSE = bool(args.verbose)
     args.bind_host, args.bind_port = parse_bind(args.bind)
 
     # split --host into (host, optional port-from-host)

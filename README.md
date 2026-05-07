@@ -38,6 +38,7 @@ python llm_proxy.py --host <upstream> [--to <port>] [--bind <host:port>]
 | `--host`  | required           | Upstream host. Accepts `host`, `host:port`, or `[v6]:port`. |
 | `--to`    | `11434`            | Upstream port. Overrides any port given in `--host`. |
 | `--bind`  | `0.0.0.0:11434`    | Local bind. Accepts `host:port`, bare port, or just host. |
+| `--verbose`, `-v` | off          | Log `[conn]` open/close lines. Hidden by default. |
 
 When `--bind` uses a wildcard host (`0.0.0.0`, `*`, or empty), the proxy listens
 on both IPv4 and IPv6 so `localhost` resolves correctly regardless of which
@@ -83,6 +84,15 @@ Type at the `>` prompt:
 When content is hidden, the proxy logs a one-line summary instead — body size,
 estimated tokens, message count for requests; size, tokens, duration, and
 tokens-per-second for responses.
+
+## Keys
+
+| key       | effect                                                          |
+|-----------|-----------------------------------------------------------------|
+| `↑` / `↓` | Navigate command history.                                       |
+| `Ctrl-E`  | Toggle single-line ↔ multi-line input. In multi-line mode `Enter` inserts a newline; `Ctrl-E` again collapses the buffer back so `Enter` will submit it. |
+| `Esc`     | Clear the current input.                                        |
+| `Ctrl-C`  | Quit.                                                           |
 
 ## Status bar layout
 
